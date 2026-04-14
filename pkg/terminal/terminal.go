@@ -10,5 +10,5 @@ package terminal
 //   - Bi-directional data flow: WebSocket ↔ PTY
 //   - Session recording for audit logs (optional)
 type Terminal struct {
-	// TODO: implement WebSocket SSH bridge
+  // TODO: implement WebSocket SSH bridge
 }
