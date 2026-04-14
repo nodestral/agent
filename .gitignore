@@ -1,0 +1,7 @@
+nodestral-agent
+*.exe
+*.test
+*.out
+*.prof
+vendor/
+.env
