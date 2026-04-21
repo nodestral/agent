@@ -10,7 +10,7 @@ import (
 
 const (
   DefaultConfigPath = "/etc/nodestral/agent.yaml"
-  DefaultAPIURL     = "https://api.nodestral.io"
+  DefaultAPIURL     = "https://nx.nodestral.web.id"
 )
 
 type Config struct {
