@@ -14,6 +14,7 @@ import (
   "github.com/nodestral/agent/pkg/provider"
   "github.com/nodestral/agent/pkg/register"
   "github.com/nodestral/agent/pkg/system"
+  "github.com/nodestral/agent/pkg/terminal"
 )
 
 const version = "0.1.0"
@@ -76,6 +77,11 @@ func main() {
   disc := discovery.New(cfg)
   go disc.StartLoop(ctx)
   log.Println("discovery loop started")
+
+  // Start terminal client (reverse WebSocket to API)
+  termClient := terminal.New(cfg)
+  go termClient.StartLoop(ctx)
+  log.Println("terminal client started")
 
   // Block until shutdown
   <-ctx.Done()
