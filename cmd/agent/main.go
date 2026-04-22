@@ -2,6 +2,7 @@ package main
 
 import (
   "context"
+  "flag"
   "log"
   "os"
   "os/signal"
@@ -18,10 +19,13 @@ import (
 const version = "0.1.0"
 
 func main() {
+  configPath := flag.String("config", "", "path to agent config file")
+  flag.Parse()
+
   log.Printf("Nodestral Agent v%s starting...", version)
 
   // Load config
-  cfg, err := config.Load("")
+  cfg, err := config.Load(*configPath)
   if err != nil {
     log.Fatalf("failed to load config: %v", err)
   }

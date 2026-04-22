@@ -142,15 +142,46 @@ func (d *Discoverer) Run(ctx context.Context) error {
 func (d *Discoverer) scan(ctx context.Context) *Snapshot {
   s := &Snapshot{}
 
-  s.Services = d.detectServices(ctx)
-  s.Packages = d.detectPackages()
-  s.Containers = d.detectDockerContainers(ctx)
-  s.ListeningPorts = d.detectListeningPorts()
-  s.Certificates = d.detectCertificates()
-  s.Firewall = d.detectFirewall()
-  s.Updates = d.detectUpdates()
-  s.SSHUsers = d.detectSSHUsers()
+  // Basic features — work with no special permissions
+  if d.cfg.Discovery.Services {
+    s.Services = d.detectServices(ctx)
+  }
+  if d.cfg.Discovery.Packages {
+    s.Packages = d.detectPackages()
+  }
+  if d.cfg.Discovery.Ports {
+    s.ListeningPorts = d.detectListeningPorts()
+  }
+  if d.cfg.Discovery.SSHUsers {
+    s.SSHUsers = d.detectSSHUsers()
+  }
   s.MonitoringTools = d.detectMonitoringTools()
+
+  // Elevated features — only run if explicitly enabled
+  if d.cfg.Discovery.Containers {
+    s.Containers = d.detectDockerContainers(ctx)
+  }
+  if d.cfg.Discovery.Certificates {
+    if certs, err := d.detectCertificates(); err != nil {
+      log.Printf("discovery: certificates: %v (see PERMISSIONS.md)", err)
+    } else {
+      s.Certificates = certs
+    }
+  }
+  if d.cfg.Discovery.Firewall {
+    if fw, err := d.detectFirewallWithCheck(); err != nil {
+      log.Printf("discovery: firewall: %v (see PERMISSIONS.md)", err)
+    } else {
+      s.Firewall = fw
+    }
+  }
+  if d.cfg.Discovery.OSUpdates {
+    if upd, err := d.detectUpdatesWithCheck(); err != nil {
+      log.Printf("discovery: os_updates: %v (see PERMISSIONS.md)", err)
+    } else {
+      s.Updates = upd
+    }
+  }
 
   return s
 }
@@ -392,49 +423,116 @@ func findProcessByInode(inode string) string {
   return ""
 }
 
-func (d *Discoverer) detectCertificates() []CertInfo {
-  // Common cert locations
+func (d *Discoverer) detectCertificates() ([]CertInfo, error) {
+  // Quick permission check before scanning
   certDirs := []string{
     "/etc/letsencrypt/live",
     "/etc/ssl/certs",
   }
+  for _, dir := range certDirs {
+    if _, err := os.Stat(dir); err != nil {
+      continue
+    }
+    // Try to read the directory
+    entries, err := os.ReadDir(dir)
+    if err != nil {
+      return nil, fmt.Errorf("permission denied reading %s", dir)
+    }
+    if len(entries) == 0 {
+      continue
+    }
+    return d.detectCertificatesFromDir(dir, entries)
+  }
+  return nil, nil
+}
 
+func (d *Discoverer) detectCertificatesFromDir(baseDir string, entries []os.DirEntry) ([]CertInfo, error) {
   var certs []CertInfo
   seen := make(map[string]bool)
 
-  for _, dir := range certDirs {
-    entries, err := os.ReadDir(dir)
+  for _, entry := range entries {
+    if !entry.IsDir() {
+      continue
+    }
+    certPath := filepath.Join(baseDir, entry.Name(), "fullchain.pem")
+    if _, err := os.Stat(certPath); err != nil {
+      certPath = filepath.Join(baseDir, entry.Name(), "cert.pem")
+      if _, err := os.Stat(certPath); err != nil {
+        continue
+      }
+    }
+
+    out, err := exec.Command("openssl", "x509", "-in", certPath,
+      "-noout", "-subject", "-issuer", "-enddate").Output()
     if err != nil {
       continue
     }
-    for _, entry := range entries {
-      if !entry.IsDir() {
-        continue
-      }
-      certPath := filepath.Join(dir, entry.Name(), "fullchain.pem")
-      if _, err := os.Stat(certPath); err != nil {
-        certPath = filepath.Join(dir, entry.Name(), "cert.pem")
-        if _, err := os.Stat(certPath); err != nil {
-          continue
+
+    info := parseCertOutput(entry.Name(), string(out))
+    if info != nil && !seen[info.Domain] {
+      seen[info.Domain] = true
+      certs = append(certs, *info)
+    }
+  }
+  return certs, nil
+}
+
+func (d *Discoverer) detectFirewallWithCheck() (*FirewallInfo, error) {
+  // Try ufw
+  if _, err := exec.LookPath("ufw"); err == nil {
+    out, err := exec.Command("ufw", "status").CombinedOutput()
+    if err != nil {
+      return nil, fmt.Errorf("ufw requires root: %s", strings.TrimSpace(string(out)))
+    }
+    status := "inactive"
+    rules := 0
+    if strings.Contains(string(out), "Status: active") {
+      status = "active"
+      for _, line := range strings.Split(string(out), "\n") {
+        if matched, _ := regexp.MatchString(`^\[\d+\]`, strings.TrimSpace(line)); matched {
+          rules++
         }
       }
+    }
+    return &FirewallInfo{Type: "ufw", Status: status, Rules: rules}, nil
+  }
+  // Try iptables
+  if _, err := exec.LookPath("iptables"); err == nil {
+    out, err := exec.Command("iptables", "-L", "-n").CombinedOutput()
+    if err != nil {
+      return nil, fmt.Errorf("iptables requires root: %s", strings.TrimSpace(string(out)))
+    }
+    rules := strings.Count(string(out), "\n") - 2
+    return &FirewallInfo{Type: "iptables", Status: "active", Rules: rules}, nil
+  }
+  return nil, fmt.Errorf("no firewall tool found (ufw or iptables)")
+}
 
-      out, err := exec.Command("openssl", "x509", "-in", certPath,
-        "-noout", "-subject", "-issuer", "-enddate").Output()
-      if err != nil {
-        continue
-      }
-
-      info := parseCertOutput(entry.Name(), string(out))
-      if info != nil && !seen[info.Domain] {
-        seen[info.Domain] = true
-        certs = append(certs, *info)
+func (d *Discoverer) detectUpdatesWithCheck() (*UpdateInfo, error) {
+  if runtime.GOOS != "linux" {
+    return nil, fmt.Errorf("os_updates only supported on linux")
+  }
+  if _, err := os.Stat("/usr/bin/apt"); err != nil {
+    return nil, fmt.Errorf("apt not found")
+  }
+  out, err := exec.Command("apt", "list", "--upgradable").CombinedOutput()
+  if err != nil {
+    return nil, fmt.Errorf("apt list failed: %s", strings.TrimSpace(string(out)))
+  }
+  pending := 0
+  critical := 0
+  for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+    if strings.Contains(line, "[upgradable") {
+      pending++
+      if strings.Contains(line, "security") {
+        critical++
       }
     }
   }
-
-  return certs
+  return &UpdateInfo{Pending: pending, Critical: critical}, nil
 }
+
+// detectCertificates (old) — replaced by detectCertificates() with permission check
 
 func parseCertOutput(domain string, output string) *CertInfo {
   info := &CertInfo{Domain: domain}
@@ -457,62 +555,8 @@ func parseCertOutput(domain string, output string) *CertInfo {
   return info
 }
 
-func (d *Discoverer) detectFirewall() *FirewallInfo {
-  // Try ufw
-  if _, err := exec.LookPath("ufw"); err == nil {
-    out, err := exec.Command("ufw", "status").Output()
-    if err == nil {
-      status := "inactive"
-      rules := 0
-      if strings.Contains(string(out), "Status: active") {
-        status = "active"
-        // Count numbered rules
-        for _, line := range strings.Split(string(out), "\n") {
-          if matched, _ := regexp.MatchString(`^\[\d+\]`, strings.TrimSpace(line)); matched {
-            rules++
-          }
-        }
-      }
-      return &FirewallInfo{Type: "ufw", Status: status, Rules: rules}
-    }
-  }
-
-  // Try iptables
-  if _, err := exec.LookPath("iptables"); err == nil {
-    out, err := exec.Command("iptables", "-L", "-n").Output()
-    if err == nil {
-      rules := strings.Count(string(out), "\n") - 2 // subtract header lines
-      return &FirewallInfo{Type: "iptables", Status: "active", Rules: rules}
-    }
-  }
-
-  return nil
-}
-
-func (d *Discoverer) detectUpdates() *UpdateInfo {
-  switch runtime.GOOS {
-  case "linux":
-    // Try apt (Debian/Ubuntu)
-    if _, err := os.Stat("/usr/bin/apt"); err == nil {
-      out, err := exec.Command("apt", "list", "--upgradable").Output()
-      if err == nil {
-        lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-        pending := 0
-        critical := 0
-        for _, line := range lines {
-          if strings.Contains(line, "[upgradable") {
-            pending++
-            if strings.Contains(line, "security") {
-              critical++
-            }
-          }
-        }
-        return &UpdateInfo{Pending: pending, Critical: critical}
-      }
-    }
-  }
-  return nil
-}
+// detectFirewall — replaced by detectFirewallWithCheck()
+// detectUpdates — replaced by detectUpdatesWithCheck()
 
 func (d *Discoverer) detectSSHUsers() []string {
   var users []string
