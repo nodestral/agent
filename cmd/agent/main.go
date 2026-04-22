@@ -10,6 +10,7 @@ import (
 
   "github.com/nodestral/agent/pkg/config"
   "github.com/nodestral/agent/pkg/discovery"
+  "github.com/nodestral/agent/pkg/exporter"
   "github.com/nodestral/agent/pkg/heartbeat"
   "github.com/nodestral/agent/pkg/provider"
   "github.com/nodestral/agent/pkg/register"
@@ -69,8 +70,14 @@ func main() {
   }()
 
   // Start heartbeat loop
+  exp := exporter.New(sysInfo.Hostname, cfg.NodeID)
  hb := heartbeat.New(cfg)
+  hb.Exporter = exp
   go hb.Run(ctx)
+
+  // Start exporter config fetcher (polls API for backend config)
+  go exporter.NewFetcher(cfg, exp).Run(ctx)
+  log.Println("exporter config fetcher started")
   log.Println("heartbeat loop started")
 
   // Start discovery loop

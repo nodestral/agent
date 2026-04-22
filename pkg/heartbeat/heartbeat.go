@@ -10,6 +10,7 @@ import (
   "time"
 
   "github.com/nodestral/agent/pkg/config"
+  "github.com/nodestral/agent/pkg/nodeexporter"
   "github.com/nodestral/agent/pkg/system"
 )
 
@@ -32,6 +33,7 @@ type Sender struct {
   cfg       *config.Config
   client    *http.Client
   failCount int
+  Exporter  interface { Push(ctx context.Context, m *system.Metrics) }
 }
 
 // New creates a new heartbeat sender.
@@ -119,5 +121,37 @@ func (s *Sender) send(ctx context.Context) {
   if s.failCount > 0 {
     log.Printf("heartbeat: reconnected after %d failures", s.failCount)
     s.failCount = 0
+  }
+
+  // Check for node_exporter action from API
+  var hbResp struct {
+    NodeExporterAction string `json:"node_exporter_action"`
+  }
+  if json.NewDecoder(resp.Body).Decode(&hbResp) == nil && hbResp.NodeExporterAction != "" {
+    s.handleNodeExporterAction(hbResp.NodeExporterAction)
+  }
+
+  // Push metrics to configured backend
+  if s.Exporter != nil {
+    s.Exporter.Push(ctx, metrics)
+  }
+}
+
+func (s *Sender) handleNodeExporterAction(action string) {
+  switch action {
+  case "install":
+    log.Println("node_exporter: install requested by API")
+    go func() {
+      if err := nodeexporter.Install(); err != nil {
+        log.Printf("node_exporter: install failed: %v", err)
+      }
+    }()
+  case "uninstall":
+    log.Println("node_exporter: uninstall requested by API")
+    go func() {
+      if err := nodeexporter.Uninstall(); err != nil {
+        log.Printf("node_exporter: uninstall failed: %v", err)
+      }
+    }()
   }
 }

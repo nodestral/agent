@@ -7,10 +7,12 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 	"github.com/nodestral/agent/pkg/config"
@@ -18,14 +20,14 @@ import (
 
 // Message is the wire format for all WebSocket messages.
 type Message struct {
-	Type     string `json:"type"`      // "exec","output","error","exit","ping","pong"
+	Type     string `json:"type"`
 	Data     string `json:"data"`
 	ExitCode int    `json:"exit_code"`
+	Columns  int    `json:"columns"`
+	Rows     int    `json:"rows"`
 }
 
 // Client connects to the nx relay via reverse WebSocket.
-// The agent connects TO the relay, browser connects TO the relay,
-// and the relay bridges them. The agent never opens a port.
 type Client struct {
 	cfg  *config.Config
 	conn *websocket.Conn
@@ -36,7 +38,6 @@ func New(cfg *config.Config) *Client {
 	return &Client{cfg: cfg}
 }
 
-// StartLoop connects to the relay and maintains the connection.
 func (c *Client) StartLoop(ctx context.Context) {
 	if !c.cfg.Terminal.Enabled {
 		log.Println("terminal: disabled (terminal.enabled = false)")
@@ -61,7 +62,6 @@ func (c *Client) StartLoop(ctx context.Context) {
 			}
 		}
 
-		// Read loop — relay sends us commands from the browser
 		err = c.readLoop(ctx)
 		if c.conn != nil {
 			c.conn.Close()
@@ -80,9 +80,7 @@ func (c *Client) StartLoop(ctx context.Context) {
 func (c *Client) connect(ctx context.Context) error {
 	wsURL := c.cfg.RelayURL + "/ws"
 
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 10 * time.Second,
-	}
+	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
 
 	header := http.Header{}
 	header.Set("Authorization", "Bearer "+c.cfg.AuthToken)
@@ -98,9 +96,117 @@ func (c *Client) connect(ctx context.Context) error {
 }
 
 func (c *Client) readLoop(ctx context.Context) error {
+	var (
+		shellCmd *exec.Cmd
+		shellIn  io.WriteCloser
+		shellMu  sync.Mutex
+		active   bool
+		done     chan struct{}
+	)
+
+	// Start a persistent bash session
+	startShell := func() error {
+		shellMu.Lock()
+		defer shellMu.Unlock()
+
+		if shellCmd != nil && shellCmd.Process != nil {
+			shellCmd.Process.Kill()
+			shellCmd.Wait()
+		}
+
+		// Use interactive bash with line editing disabled for pipe mode
+		shellCmd = exec.Command("bash", "--norc", "--noprofile")
+		shellCmd.Dir = c.cfg.HomeDir
+		if shellCmd.Dir == "" {
+			shellCmd.Dir = "/opt/nodestral/agent"
+		}
+		shellCmd.Env = append([]string{
+			"TERM=dumb",
+			"PS1=nodestral $ ",
+		}, shellEnviron()...)
+
+		var err error
+		shellIn, err = shellCmd.StdinPipe()
+		if err != nil {
+			return fmt.Errorf("stdin pipe: %w", err)
+		}
+
+		stdout, err := shellCmd.StdoutPipe()
+		if err != nil {
+			return fmt.Errorf("stdout pipe: %w", err)
+		}
+
+		stderr, err := shellCmd.StderrPipe()
+		if err != nil {
+			return fmt.Errorf("stderr pipe: %w", err)
+		}
+
+		if err := shellCmd.Start(); err != nil {
+			return fmt.Errorf("shell start: %w", err)
+		}
+
+		active = true
+		done = make(chan struct{})
+
+		// Stream stdout
+		go func() {
+			defer close(done)
+			buf := make([]byte, 8192)
+			for {
+				n, err := stdout.Read(buf)
+				if n > 0 {
+					c.send(Message{Type: "output", Data: sanitizeOutput(buf[:n])})
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+
+		// Stream stderr
+		go func() {
+			buf := make([]byte, 8192)
+			for {
+				n, err := stderr.Read(buf)
+				if n > 0 {
+					c.send(Message{Type: "output", Data: sanitizeOutput(buf[:n])})
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+
+		// Wait for shell exit
+		go func() {
+			shellCmd.Wait()
+			c.send(Message{Type: "exit", ExitCode: 0})
+			shellMu.Lock()
+			active = false
+			shellMu.Unlock()
+		}()
+
+		return nil
+	}
+
+	writeShell := func(data string) error {
+		shellMu.Lock()
+		defer shellMu.Unlock()
+		if !active || shellIn == nil {
+			return fmt.Errorf("no active shell")
+		}
+		_, err := fmt.Fprint(shellIn, data)
+		return err
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
+			shellMu.Lock()
+			if shellCmd != nil && shellCmd.Process != nil {
+				shellCmd.Process.Kill()
+			}
+			shellMu.Unlock()
 			return nil
 		default:
 		}
@@ -112,129 +218,78 @@ func (c *Client) readLoop(ctx context.Context) error {
 
 		var m Message
 		if err := json.Unmarshal(msg, &m); err != nil {
-			c.send(Message{Type: "error", Data: "invalid message format"})
 			continue
 		}
 
 		switch m.Type {
+		case "start_shell":
+			if err := startShell(); err != nil {
+				c.send(Message{Type: "error", Data: err.Error()})
+			} else {
+				time.Sleep(200 * time.Millisecond) // let shell initialize
+			}
+
 		case "exec":
-			c.handleExec(m.Data)
+			if !active {
+				if err := startShell(); err != nil {
+					c.send(Message{Type: "error", Data: err.Error()})
+					continue
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+			cmd := m.Data
+			if !strings.HasSuffix(cmd, "\n") {
+				cmd += "\n"
+			}
+			if err := writeShell(cmd); err != nil {
+				c.send(Message{Type: "error", Data: err.Error()})
+			}
+
+		case "input":
+			if !active {
+				continue
+			}
+			if err := writeShell(m.Data); err != nil {
+				c.send(Message{Type: "error", Data: err.Error()})
+			}
+
+		case "resize":
+			// No-op with pipes (PTY needed for resize)
+
 		case "ping":
 			c.send(Message{Type: "pong"})
 		}
 	}
 }
 
-// allowedPrefixes — commands the agent is allowed to execute.
-var allowedPrefixes = []string{
-	"ls", "cat", "head", "tail", "less", "more", "grep", "find", "wc", "sort", "uniq",
-	"df", "du", "free", "top", "htop", "ps", "pgrep", "uptime", "whoami", "id",
-	"uname", "hostname", "date", "timedatectl",
-	"ip", "ss", "netstat", "ping", "traceroute", "dig", "nslookup", "curl",
-	"systemctl", "journalctl", "service",
-	"docker", "podman",
-	"apt", "apt-get", "dpkg",
-	"env", "printenv", "echo",
-	"stat", "file", "which", "whereis",
-	"mkdir", "touch", "cp", "mv", "rm", "chmod", "chown", "ln",
-	"tar", "gzip", "gunzip",
-	"openssl", "certbot",
-	"crontab",
-	"python3", "node", "go", "gcc",
-}
-
-var blockedPatterns = []string{
-	"rm -rf /", "rm -rf /*", "mkfs", "dd if=", "shutdown", "reboot",
-	"poweroff", "halt", "init 0", "init 6",
-}
-
-func isCommandAllowed(cmd string) bool {
-	for _, p := range blockedPatterns {
-		if strings.Contains(cmd, p) {
-			return false
+// shellEnviron returns a clean environment for the shell.
+func shellEnviron() []string {
+	// Inherit PATH, HOME, LANG from agent process
+	var env []string
+	for _, e := range []string{"PATH", "HOME", "LANG", "USER"} {
+		if v := os.Getenv(e); v != "" {
+			env = append(env, e+"="+v)
 		}
 	}
-	parts := strings.Fields(cmd)
-	if len(parts) == 0 {
-		return false
-	}
-	base := parts[0]
-	if idx := strings.LastIndex(base, "/"); idx >= 0 {
-		base = base[idx+1:]
-	}
-	for _, prefix := range allowedPrefixes {
-		if base == prefix || strings.HasPrefix(base, prefix) {
-			return true
-		}
-	}
-	return false
+	return env
 }
 
-func (c *Client) handleExec(cmd string) {
-	cmd = strings.TrimSpace(cmd)
-	if cmd == "" {
-		return
+func sanitizeOutput(data []byte) string {
+	if utf8.Valid(data) {
+		return string(data)
 	}
-
-	if !isCommandAllowed(cmd) {
-		c.send(Message{Type: "error", Data: fmt.Sprintf("command not allowed: %s", cmd)})
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	shell := exec.CommandContext(ctx, "bash", "-c", cmd)
-
-	stdout, err := shell.StdoutPipe()
-	if err != nil {
-		c.send(Message{Type: "error", Data: err.Error()})
-		return
-	}
-	stderr, err := shell.StderrPipe()
-	if err != nil {
-		c.send(Message{Type: "error", Data: err.Error()})
-		return
-	}
-
-	if err := shell.Start(); err != nil {
-		c.send(Message{Type: "error", Data: err.Error()})
-		return
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	stream := func(r io.Reader, msgType string) {
-		defer wg.Done()
-		buf := make([]byte, 4096)
-		for {
-			n, err := r.Read(buf)
-			if n > 0 {
-				c.send(Message{Type: msgType, Data: string(buf[:n])})
-			}
-			if err != nil {
-				break
-			}
-		}
-	}
-
-	go stream(stdout, "output")
-	go stream(stderr, "error")
-
-	wg.Wait()
-	err = shell.Wait()
-
-	exitCode := 0
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
+	var b strings.Builder
+	b.Grow(len(data))
+	for len(data) > 0 {
+		r, size := utf8.DecodeRune(data)
+		if r == utf8.RuneError && size == 1 {
+			b.WriteByte('?')
 		} else {
-			c.send(Message{Type: "error", Data: err.Error()})
+			b.WriteRune(r)
 		}
+		data = data[size:]
 	}
-
-	c.send(Message{Type: "exit", ExitCode: exitCode})
+	return b.String()
 }
 
 func (c *Client) send(m Message) {

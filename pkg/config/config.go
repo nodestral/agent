@@ -17,6 +17,7 @@ const (
 type Config struct {
 	APIURL            string            `yaml:"api_url"`
 	RelayURL          string            `yaml:"relay_url"`
+	HomeDir           string            `yaml:"home_dir"` // terminal working directory
 	NodeID            string            `yaml:"node_id"`
 	AuthToken         string            `yaml:"auth_token"`
 	HeartbeatInterval time.Duration     `yaml:"heartbeat_interval"`
@@ -25,12 +26,10 @@ type Config struct {
 	Terminal          TerminalConfig    `yaml:"terminal"`
 }
 
-// TerminalConfig controls the remote terminal feature.
 type TerminalConfig struct {
-	Enabled bool `yaml:"enabled"` // opt-in — agent must explicitly enable
+	Enabled bool `yaml:"enabled"`
 }
 
-// DiscoveryFeatures controls what the agent collects.
 type DiscoveryFeatures struct {
 	Services     bool `yaml:"services"`
 	Packages     bool `yaml:"packages"`
@@ -78,6 +77,12 @@ func Load(path string) (*Config, error) {
 	}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, err
+	}
+	// Resolve home_dir: if not set, use current working directory
+	if cfg.HomeDir == "" {
+		if wd, err := os.Getwd(); err == nil {
+			cfg.HomeDir = wd
+		}
 	}
 	return cfg, nil
 }
