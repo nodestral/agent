@@ -98,6 +98,9 @@ func New(cfg *config.Config) *Discoverer {
 // Run performs a full discovery scan and reports to the API.
 func (d *Discoverer) Run(ctx context.Context) error {
   snapshot := d.scan(ctx)
+  log.Printf("discovery: scan complete — firewall=%v updates=%v services=%d ports=%d certs=%d",
+    snapshot.Firewall != nil, snapshot.Updates != nil,
+    len(snapshot.Services), len(snapshot.ListeningPorts), len(snapshot.Certificates))
 
   payloadData, err := json.Marshal(snapshot)
   if err != nil {
@@ -478,9 +481,13 @@ func (d *Discoverer) detectCertificatesFromDir(baseDir string, entries []os.DirE
 }
 
 func (d *Discoverer) detectFirewallWithCheck() (*FirewallInfo, error) {
-  // Try ufw
+  // Try ufw (use sudo if available)
+  ufwCmd := "ufw"
+  if os.Getuid() != 0 {
+    ufwCmd = "sudo ufw"
+  }
   if _, err := exec.LookPath("ufw"); err == nil {
-    out, err := exec.Command("ufw", "status").CombinedOutput()
+    out, err := exec.Command("sh", "-c", ufwCmd+" status").CombinedOutput()
     if err != nil {
       return nil, fmt.Errorf("ufw requires root: %s", strings.TrimSpace(string(out)))
     }
@@ -496,9 +503,13 @@ func (d *Discoverer) detectFirewallWithCheck() (*FirewallInfo, error) {
     }
     return &FirewallInfo{Type: "ufw", Status: status, Rules: rules}, nil
   }
-  // Try iptables
+  // Try iptables (use sudo if available)
   if _, err := exec.LookPath("iptables"); err == nil {
-    out, err := exec.Command("iptables", "-L", "-n").CombinedOutput()
+    iptCmd := "iptables -L -n"
+    if os.Getuid() != 0 {
+      iptCmd = "sudo iptables -L -n"
+    }
+    out, err := exec.Command("sh", "-c", iptCmd).CombinedOutput()
     if err != nil {
       return nil, fmt.Errorf("iptables requires root: %s", strings.TrimSpace(string(out)))
     }
@@ -515,7 +526,11 @@ func (d *Discoverer) detectUpdatesWithCheck() (*UpdateInfo, error) {
   if _, err := os.Stat("/usr/bin/apt"); err != nil {
     return nil, fmt.Errorf("apt not found")
   }
-  out, err := exec.Command("apt", "list", "--upgradable").CombinedOutput()
+  aptCmd := "apt list --upgradable"
+  if os.Getuid() != 0 {
+    aptCmd = "sudo apt list --upgradable"
+  }
+  out, err := exec.Command("sh", "-c", aptCmd).CombinedOutput()
   if err != nil {
     return nil, fmt.Errorf("apt list failed: %s", strings.TrimSpace(string(out)))
   }
