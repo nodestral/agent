@@ -480,16 +480,26 @@ func (d *Discoverer) detectCertificatesFromDir(baseDir string, entries []os.DirE
   return certs, nil
 }
 
-func (d *Discoverer) detectFirewallWithCheck() (*FirewallInfo, error) {
-  // Try ufw (use sudo if available)
-  ufwCmd := "ufw"
-  if os.Getuid() != 0 {
-    ufwCmd = "sudo ufw"
+// tryCmd runs cmd, then if non-root and it fails, retries once with sudo prefix.
+func tryCmd(cmd string) ([]byte, error) {
+  out, err := exec.Command("sh", "-c", cmd).CombinedOutput()
+  if err == nil {
+    return out, nil
   }
+  if os.Getuid() != 0 {
+    sudoCmd := "sudo " + cmd
+    if out2, err2 := exec.Command("sh", "-c", sudoCmd).CombinedOutput(); err2 == nil {
+      return out2, nil
+    }
+  }
+  return out, err
+}
+
+func (d *Discoverer) detectFirewallWithCheck() (*FirewallInfo, error) {
   if _, err := exec.LookPath("ufw"); err == nil {
-    out, err := exec.Command("sh", "-c", ufwCmd+" status").CombinedOutput()
+    out, err := tryCmd("ufw status")
     if err != nil {
-      return nil, fmt.Errorf("ufw requires root: %s", strings.TrimSpace(string(out)))
+      return nil, fmt.Errorf("ufw failed: %s", strings.TrimSpace(string(out)))
     }
     status := "inactive"
     rules := 0
@@ -503,15 +513,10 @@ func (d *Discoverer) detectFirewallWithCheck() (*FirewallInfo, error) {
     }
     return &FirewallInfo{Type: "ufw", Status: status, Rules: rules}, nil
   }
-  // Try iptables (use sudo if available)
   if _, err := exec.LookPath("iptables"); err == nil {
-    iptCmd := "iptables -L -n"
-    if os.Getuid() != 0 {
-      iptCmd = "sudo iptables -L -n"
-    }
-    out, err := exec.Command("sh", "-c", iptCmd).CombinedOutput()
+    out, err := tryCmd("iptables -L -n")
     if err != nil {
-      return nil, fmt.Errorf("iptables requires root: %s", strings.TrimSpace(string(out)))
+      return nil, fmt.Errorf("iptables failed: %s", strings.TrimSpace(string(out)))
     }
     rules := strings.Count(string(out), "\n") - 2
     return &FirewallInfo{Type: "iptables", Status: "active", Rules: rules}, nil
@@ -526,11 +531,7 @@ func (d *Discoverer) detectUpdatesWithCheck() (*UpdateInfo, error) {
   if _, err := os.Stat("/usr/bin/apt"); err != nil {
     return nil, fmt.Errorf("apt not found")
   }
-  aptCmd := "apt list --upgradable"
-  if os.Getuid() != 0 {
-    aptCmd = "sudo apt list --upgradable"
-  }
-  out, err := exec.Command("sh", "-c", aptCmd).CombinedOutput()
+  out, err := tryCmd("apt list --upgradable")
   if err != nil {
     return nil, fmt.Errorf("apt list failed: %s", strings.TrimSpace(string(out)))
   }
