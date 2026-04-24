@@ -12,8 +12,9 @@ import (
 
 // Provider represents a detected cloud provider.
 type Provider struct {
-  Name   string `json:"name"`
-  Region string `json:"region"`
+  Name         string `json:"name"`
+  Region       string `json:"region"`
+  InstanceType string `json:"instance_type"`
 }
 
 // Detector attempts to detect the cloud provider from metadata services.
@@ -58,19 +59,23 @@ func (d *Detector) Detect(ctx context.Context) *Provider {
 }
 
 func (d *Detector) detectTencent(ctx context.Context) (*Provider, error) {
-  return d.detectMetadata(ctx, "http://metadata.tencentyun.com/latest/meta-data/",
+  return d.detectMetadataWithInstanceType(ctx, "http://metadata.tencentyun.com/latest/meta-data/",
     map[string]string{
       "instance-id":  "instance-id",
       "placement/zone": "zone",
-    }, "tencent")
+    },
+    "instance/instance-type",
+    "tencent")
 }
 
 func (d *Detector) detectAWS(ctx context.Context) (*Provider, error) {
-  return d.detectMetadata(ctx, "http://169.254.169.254/latest/meta-data/",
+  return d.detectMetadataWithInstanceType(ctx, "http://169.254.169.254/latest/meta-data/",
     map[string]string{
-      "instance-id":         "instance-id",
+      "instance-id":              "instance-id",
       "placement/availability-zone": "zone",
-    }, "aws")
+    },
+    "instance-type",
+    "aws")
 }
 
 func (d *Detector) detectGCP(ctx context.Context) (*Provider, error) {
@@ -180,6 +185,53 @@ func (d *Detector) detectDigitalOcean(ctx context.Context) (*Provider, error) {
   }
 
   return &Provider{Name: "digitalocean", Region: data.Region}, nil
+}
+
+// detectMetadataWithInstanceType is like detectMetadata but also fetches the instance type.
+func (d *Detector) detectMetadataWithInstanceType(ctx context.Context, baseURL string, keys map[string]string, instanceTypeKey, providerName string) (*Provider, error) {
+  var instanceID, zone, instanceType string
+
+  // Fetch instance type
+  req, err := http.NewRequestWithContext(ctx, "GET", baseURL+instanceTypeKey, nil)
+  if err == nil {
+    if resp, err := d.httpClient.Do(req); err == nil && resp.StatusCode == 200 {
+      body, _ := io.ReadAll(io.LimitReader(resp.Body, 128))
+      instanceType = strings.TrimSpace(string(body))
+      resp.Body.Close()
+    } else if resp != nil {
+      resp.Body.Close()
+    }
+  }
+
+  for key := range keys {
+    req, err := http.NewRequestWithContext(ctx, "GET", baseURL+key, nil)
+    if err != nil {
+      continue
+    }
+    resp, err := d.httpClient.Do(req)
+    if err != nil || resp.StatusCode != 200 {
+      if resp != nil {
+        resp.Body.Close()
+      }
+      return nil, fmt.Errorf("not %s", providerName)
+    }
+    defer resp.Body.Close()
+
+    body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+    val := strings.TrimSpace(string(body))
+
+    if strings.Contains(key, "zone") {
+      zone = val
+    } else {
+      instanceID = val
+    }
+  }
+
+  if instanceID == "" {
+    return nil, fmt.Errorf("not %s", providerName)
+  }
+
+  return &Provider{Name: providerName, Region: zone, InstanceType: instanceType}, nil
 }
 
 // detectMetadata is a generic helper for simple key-based metadata endpoints.
