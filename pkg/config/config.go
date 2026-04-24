@@ -17,17 +17,12 @@ const (
 type Config struct {
 	APIURL            string            `yaml:"api_url"`
 	RelayURL          string            `yaml:"relay_url"`
-	HomeDir           string            `yaml:"home_dir"` // terminal working directory
+	HomeDir           string            `yaml:"home_dir"`
 	NodeID            string            `yaml:"node_id"`
 	AuthToken         string            `yaml:"auth_token"`
 	HeartbeatInterval time.Duration     `yaml:"heartbeat_interval"`
 	DiscoveryInterval time.Duration     `yaml:"discovery_interval"`
 	Discovery         DiscoveryFeatures `yaml:"discovery"`
-	Terminal          TerminalConfig    `yaml:"terminal"`
-}
-
-type TerminalConfig struct {
-	Enabled bool `yaml:"enabled"`
 }
 
 type DiscoveryFeatures struct {
@@ -47,9 +42,6 @@ func DefaultConfig() *Config {
 		RelayURL:          DefaultRelayURL,
 		HeartbeatInterval: 30 * time.Second,
 		DiscoveryInterval: 5 * time.Minute,
-		Terminal: TerminalConfig{
-			Enabled: false,
-		},
 		Discovery: DiscoveryFeatures{
 			Services: true,
 			Packages: true,
