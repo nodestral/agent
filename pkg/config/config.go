@@ -55,10 +55,28 @@ func DefaultConfig() *Config {
 	}
 }
 
-func Load(path string) (*Config, error) {
-	if path == "" {
-		path = DefaultConfigPath
+func resolveConfigPath(path string) string {
+	if path != "" {
+		return path
 	}
+	// 1. Explicit path given
+	// 2. Check user config (~/.config/nodestral/agent.yaml)
+	if home, err := os.UserHomeDir(); err == nil {
+		userPath := filepath.Join(home, ".config", "nodestral", "agent.yaml")
+		if _, err := os.Stat(userPath); err == nil {
+			return userPath
+		}
+	}
+	// 3. Check current directory
+	if _, err := os.Stat("agent.yaml"); err == nil {
+		return "agent.yaml"
+	}
+	// 4. Default system path
+	return DefaultConfigPath
+}
+
+func Load(path string) (*Config, error) {
+	path = resolveConfigPath(path)
 	cfg := DefaultConfig()
 	data, err := os.ReadFile(path)
 	if err != nil {
