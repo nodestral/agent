@@ -211,44 +211,96 @@ func (d *Discoverer) StartLoop(ctx context.Context) {
   }
 }
 
+// knownServiceNames returns service names that should be tracked even when stopped.
+var knownServiceNames = map[string]string{
+  "nginx":         "nginx -v 2>&1",
+  "postgresql":    "psql --version",
+  "redis":         "redis-server --version",
+  "mysql":         "mysql --version",
+  "docker":        "docker --version",
+  "mongod":        "mongod --version",
+  "mariadb":       "mariadb --version",
+  "redis-server":  "redis-server --version",
+  "node_exporter": "node_exporter --version",
+  "grafana-agent": "grafana-agent --version",
+  "netdata":       "netdata -v",
+  "telegraf":      "telegraf --version",
+}
+
 func (d *Discoverer) detectServices(ctx context.Context) []ServiceInfo {
-  // Notable services to report with version detection
-  notableServices := map[string]string{
-    "nginx":      "nginx -v 2>&1",
-    "postgresql": "psql --version",
-    "redis":      "redis-server --version",
-    "mysql":      "mysql --version",
-    "docker":     "docker --version",
-    "mongod":     "mongod --version",
-  }
-
   var services []ServiceInfo
+  seen := make(map[string]bool)
 
-  // Get running systemd services
+  // Get ALL loaded systemd services (running + exited + failed)
   out, err := exec.CommandContext(ctx, "systemctl", "list-units",
-    "--type=service", "--state=running", "--no-legend", "--no-pager").Output()
+    "--type=service", "--all", "--no-legend", "--no-pager").Output()
   if err == nil {
     lines := strings.Split(strings.TrimSpace(string(out)), "\n")
     for _, line := range lines {
       fields := strings.Fields(line)
-      if len(fields) < 1 {
+      if len(fields) < 4 {
         continue
       }
       name := strings.TrimSuffix(fields[0], ".service")
-      svc := ServiceInfo{Name: name, Status: "running"}
+      active := fields[2] // active, inactive, failed
+      seen[name] = true
 
-      // Try to get version for notable services
-      if cmd, ok := notableServices[name]; ok {
+      // Skip noise services regardless of state
+      if isNoisyService(name) {
+        continue
+      }
+
+      status := "stopped"
+      if active == "active" {
+        status = "running"
+      } else if active == "failed" {
+        status = "failed"
+      }
+
+      svc := ServiceInfo{Name: name, Status: status}
+      if cmd, ok := knownServiceNames[name]; ok {
         if ver := getVersion(cmd); ver != "" {
           svc.Version = ver
         }
       }
-
       services = append(services, svc)
     }
   }
 
+  // Also check known services that might not be loaded at all
+  for name, cmd := range knownServiceNames {
+    if seen[name] {
+      continue
+    }
+    // Check if the service unit exists at all
+    if _, err := exec.CommandContext(ctx, "systemctl", "cat", name+".service").CombinedOutput(); err != nil {
+      continue // unit doesn't exist
+    }
+    ver := getVersion(cmd)
+    svc := ServiceInfo{Name: name, Status: "stopped"}
+    if ver != "" {
+      svc.Version = ver
+    }
+    services = append(services, svc)
+  }
+
   return services
+}
+
+func isNoisyService(name string) bool {
+  noisy := map[string]bool{
+    "dbus": true, "getty@tty1": true, "serial-getty@ttyS0": true,
+    "polkit": true, "rsyslog": true, "snapd": true,
+    "systemd-journald": true, "systemd-logind": true, "systemd-networkd": true,
+    "systemd-resolved": true, "systemd-udevd": true, "user@1000": true,
+    "multipathd": true, "udisks2": true, "upower": true,
+    "ModemManager": true, "networkd-dispatcher": true,
+    "fwupd": true, "unattended-upgrades": true, "cron": true,
+    "ssh": true, "ufw": true, "apparmor": true,
+    "accounts-daemon": true, "irqbalance": true,
+    "thermald": true, "plymouth": true,
+  }
+  return noisy[name]
 }
 
 func (d *Discoverer) detectPackages() []PackageInfo {
