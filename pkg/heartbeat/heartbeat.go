@@ -26,6 +26,10 @@ type Payload struct {
   NetTxBytes uint64         `json:"net_tx_bytes"`
   Load1m     float64        `json:"load_1m"`
   Load5m     float64        `json:"load_5m"`
+  // Provider info (sent every heartbeat, API ignores if empty)
+  ProviderName     string `json:"provider_name,omitempty"`
+  ProviderRegion   string `json:"provider_region,omitempty"`
+  ProviderInstType string `json:"provider_instance_type,omitempty"`
 }
 
 // Sender sends periodic heartbeats to the Nodestral API.
@@ -34,15 +38,21 @@ type Sender struct {
   client    *http.Client
   failCount int
   Exporter  interface { Push(ctx context.Context, m *system.Metrics) }
+  providerName     string
+  providerRegion   string
+  providerInstType string
 }
 
 // New creates a new heartbeat sender.
-func New(cfg *config.Config) *Sender {
+func New(cfg *config.Config, provName, provRegion, provInstType string) *Sender {
   return &Sender{
     cfg: cfg,
     client: &http.Client{
       Timeout: 10 * time.Second,
     },
+    providerName:     provName,
+    providerRegion:   provRegion,
+    providerInstType: provInstType,
   }
 }
 
@@ -72,16 +82,19 @@ func (s *Sender) send(ctx context.Context) {
   }
 
   payload := Payload{
-    NodeID:      s.cfg.NodeID,
-    CPUPercent:  metrics.CPUPercent,
-    RAMPercent:  metrics.RAMPercent,
-    RAMUsedMB:   metrics.RAMUsedMB,
-    DiskPercent: metrics.DiskPercent,
-    DiskUsedGB:  metrics.DiskUsedGB,
-    NetRxBytes:  metrics.NetRxBytes,
-    NetTxBytes:  metrics.NetTxBytes,
-    Load1m:      metrics.Load1m,
-    Load5m:      metrics.Load5m,
+    NodeID:           s.cfg.NodeID,
+    CPUPercent:       metrics.CPUPercent,
+    RAMPercent:       metrics.RAMPercent,
+    RAMUsedMB:        metrics.RAMUsedMB,
+    DiskPercent:      metrics.DiskPercent,
+    DiskUsedGB:       metrics.DiskUsedGB,
+    NetRxBytes:       metrics.NetRxBytes,
+    NetTxBytes:       metrics.NetTxBytes,
+    Load1m:           metrics.Load1m,
+    Load5m:           metrics.Load5m,
+    ProviderName:     s.providerName,
+    ProviderRegion:   s.providerRegion,
+    ProviderInstType: s.providerInstType,
   }
 
   data, err := json.Marshal(payload)
