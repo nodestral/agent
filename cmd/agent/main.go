@@ -70,7 +70,7 @@ func main() {
 
   // Start heartbeat loop
   exp := exporter.New(sysInfo.Hostname, cfg.NodeID)
- hb := heartbeat.New(cfg, prov.Name, prov.Region, prov.InstanceType)
+ hb := heartbeat.New(cfg, prov.Name, prov.Region, prov.InstanceType, version)
   hb.Exporter = exp
   go hb.Run(ctx)
 

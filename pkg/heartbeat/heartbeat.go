@@ -11,6 +11,7 @@ import (
 
   "github.com/nodestral/agent/pkg/config"
   "github.com/nodestral/agent/pkg/nodeexporter"
+  "github.com/nodestral/agent/pkg/selfupdate"
   "github.com/nodestral/agent/pkg/system"
 )
 
@@ -41,10 +42,11 @@ type Sender struct {
   providerName     string
   providerRegion   string
   providerInstType string
+  agentVersion     string
 }
 
 // New creates a new heartbeat sender.
-func New(cfg *config.Config, provName, provRegion, provInstType string) *Sender {
+func New(cfg *config.Config, provName, provRegion, provInstType, agentVer string) *Sender {
   return &Sender{
     cfg: cfg,
     client: &http.Client{
@@ -53,6 +55,7 @@ func New(cfg *config.Config, provName, provRegion, provInstType string) *Sender 
     providerName:     provName,
     providerRegion:   provRegion,
     providerInstType: provInstType,
+    agentVersion:     agentVer,
   }
 }
 
@@ -136,12 +139,21 @@ func (s *Sender) send(ctx context.Context) {
     s.failCount = 0
   }
 
-  // Check for node_exporter action from API
+  // Parse full response for self-update check
+  bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
   var hbResp struct {
     NodeExporterAction string `json:"node_exporter_action"`
+    LatestAgentVersion string `json:"latest_agent_version"`
   }
-  if json.NewDecoder(resp.Body).Decode(&hbResp) == nil && hbResp.NodeExporterAction != "" {
-    s.handleNodeExporterAction(hbResp.NodeExporterAction)
+  if json.Unmarshal(bodyBytes, &hbResp) == nil {
+    if hbResp.NodeExporterAction != "" {
+      s.handleNodeExporterAction(hbResp.NodeExporterAction)
+    }
+    if hbResp.LatestAgentVersion != "" {
+      // Run self-update in background (will restart if successful)
+      ver := s.agentVersion
+      go selfupdate.Check(ver, map[string]interface{}{"latest_agent_version": hbResp.LatestAgentVersion})
+    }
   }
 
   // Push metrics to configured backend
