@@ -17,7 +17,7 @@ import (
   "github.com/nodestral/agent/pkg/system"
 )
 
-const version = "0.2.3"
+const version = "0.2.4"
 
 func main() {
   configPath := flag.String("config", "", "path to agent config file")
