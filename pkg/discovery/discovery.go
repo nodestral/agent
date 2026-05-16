@@ -231,18 +231,10 @@ func (d *Discoverer) detectServices(ctx context.Context) []ServiceInfo {
   var services []ServiceInfo
   seen := make(map[string]bool)
 
-  // Get ALL loaded systemd services (running + exited + failed)
-  // Check both system-level and user-level services
-  systemctlCmds := [][]string{
-    {"systemctl", "list-units", "--type=service", "--all", "--no-legend", "--no-pager"},
-    {"systemctl", "--user", "list-units", "--type=service", "--all", "--no-legend", "--no-pager"},
-  }
-
-  for _, cmd := range systemctlCmds {
-    out, err := exec.CommandContext(ctx, cmd[0], cmd[1:]...).Output()
-    if err != nil {
-      continue // user-level may not be available
-    }
+  // System-level services — includes ALL services regardless of owning user
+  out, err := exec.CommandContext(ctx, "systemctl", "list-units",
+    "--type=service", "--all", "--no-legend", "--no-pager").Output()
+  if err == nil {
     lines := strings.Split(strings.TrimSpace(string(out)), "\n")
     for _, line := range lines {
       fields := strings.Fields(line)
@@ -280,6 +272,17 @@ func (d *Discoverer) detectServices(ctx context.Context) []ServiceInfo {
     }
   }
 
+  // Also discover user-level services via cgroup tree
+  // This finds services started with 'systemctl --user start' by any user
+  if userSvcs := d.detectUserServices(ctx); userSvcs != nil {
+    for _, svc := range userSvcs {
+      if !seen[svc.Name] {
+        services = append(services, svc)
+        seen[svc.Name] = true
+      }
+    }
+  }
+
   // Also check known services that might not be loaded at all
   for name, cmd := range knownServiceNames {
     if seen[name] {
@@ -297,6 +300,101 @@ func (d *Discoverer) detectServices(ctx context.Context) []ServiceInfo {
     services = append(services, svc)
   }
 
+  return services
+}
+
+// detectUserServices discovers user-level systemd services by walking /run/user/.
+// This finds services started by non-root users via 'systemctl --user start'.
+func (d *Discoverer) detectUserServices(ctx context.Context) []ServiceInfo {
+  userDir := "/run/user"
+  entries, err := os.ReadDir(userDir)
+  if err != nil {
+    return nil // /run/user not readable or doesn't exist
+  }
+
+  var services []ServiceInfo
+
+  for _, entry := range entries {
+    if !entry.IsDir() {
+      continue
+    }
+    uid := entry.Name()
+
+    // Skip root's user session (already covered by system-level systemctl)
+    if uid == "0" {
+      continue
+    }
+
+    // Check if the user has a systemd manager running
+    privateSocket := filepath.Join(userDir, uid, "systemd", "private")
+    if _, err := os.Stat(privateSocket); err != nil {
+      continue
+    }
+
+    // Read the cgroup tree to find services under this user's slice
+    slicePath := fmt.Sprintf("/sys/fs/cgroup/user.slice/user-%s.slice", uid)
+    svcs := d.readServicesFromCgroup(slicePath)
+    services = append(services, svcs...)
+  }
+
+  return services
+}
+
+// readServicesFromCgroup reads a systemd cgroup tree and extracts service names.
+func (d *Discoverer) readServicesFromCgroup(slicePath string) []ServiceInfo {
+  var services []ServiceInfo
+
+  // Walk the cgroup directory tree looking for service scopes
+  var walk func(path string)
+  walk = func(path string) {
+    entries, err := os.ReadDir(path)
+    if err != nil {
+      return
+    }
+    for _, entry := range entries {
+      if !entry.IsDir() {
+        continue
+      }
+      name := entry.Name()
+
+      // Detect service units (end in .service or contain .service in the name)
+      if strings.HasSuffix(name, ".service") {
+        // Extract service name: "openclaw-gateway.service" → "openclaw-gateway"
+        svcName := strings.TrimSuffix(name, ".service")
+
+        // Skip user manager services (e.g. user@1004.service) but recurse into them
+        if strings.HasPrefix(svcName, "user@") {
+          walk(filepath.Join(path, name))
+          continue
+        }
+
+        // Check if service is running by looking for the cgroup procs file
+        status := "stopped"
+        procsFile := filepath.Join(path, name, "cgroup.procs")
+        if data, err := os.ReadFile(procsFile); err == nil {
+          if len(strings.TrimSpace(string(data))) > 0 {
+            status = "running"
+          }
+        }
+
+        svc := ServiceInfo{Name: svcName, Status: status}
+        if cmd, ok := knownServiceNames[svcName]; ok {
+          if ver := getVersion(cmd); ver != "" {
+            svc.Version = ver
+          }
+        }
+        services = append(services, svc)
+        continue
+      }
+
+      // Recurse into subdirectories (e.g. app.slice, session.slice)
+      if strings.HasSuffix(name, ".slice") {
+        walk(filepath.Join(path, name))
+      }
+    }
+  }
+
+  walk(slicePath)
   return services
 }
 
