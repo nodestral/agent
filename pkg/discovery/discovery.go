@@ -232,9 +232,17 @@ func (d *Discoverer) detectServices(ctx context.Context) []ServiceInfo {
   seen := make(map[string]bool)
 
   // Get ALL loaded systemd services (running + exited + failed)
-  out, err := exec.CommandContext(ctx, "systemctl", "list-units",
-    "--type=service", "--all", "--no-legend", "--no-pager").Output()
-  if err == nil {
+  // Check both system-level and user-level services
+  systemctlCmds := [][]string{
+    {"systemctl", "list-units", "--type=service", "--all", "--no-legend", "--no-pager"},
+    {"systemctl", "--user", "list-units", "--type=service", "--all", "--no-legend", "--no-pager"},
+  }
+
+  for _, cmd := range systemctlCmds {
+    out, err := exec.CommandContext(ctx, cmd[0], cmd[1:]...).Output()
+    if err != nil {
+      continue // user-level may not be available
+    }
     lines := strings.Split(strings.TrimSpace(string(out)), "\n")
     for _, line := range lines {
       fields := strings.Fields(line)
@@ -243,6 +251,11 @@ func (d *Discoverer) detectServices(ctx context.Context) []ServiceInfo {
       }
       name := strings.TrimSuffix(fields[0], ".service")
       active := fields[2] // active, inactive, failed
+
+      // Deduplicate (system takes precedence)
+      if seen[name] {
+        continue
+      }
       seen[name] = true
 
       // Skip noise services regardless of state
