@@ -144,6 +144,35 @@ See [PERMISSIONS.md](./PERMISSIONS.md) for the full setup guide.
     Path to config file (default: /etc/nodestral/agent.yaml)
 ```
 
+## Subcommands
+
+### setup-permissions
+
+Creates a scoped sudoers file so the agent can restart services without a password. Run once after installation.
+
+```bash
+sudo nodestral-agent setup-permissions
+```
+
+This grants the agent user (or root) passwordless sudo for:
+- `systemctl start *`
+- `systemctl stop *`
+- `systemctl restart *`
+- `systemctl status *`
+
+If the agent already runs as root, no setup is needed.
+
+## Service Restart
+
+The agent can restart failed services from the dashboard. When a user clicks "Restart" on a service:
+
+1. API queues the restart request on the node
+2. Agent picks it up on next heartbeat (~30s)
+3. Executes `systemctl restart <service>` (tries without sudo, then with sudo)
+4. Reports result back via heartbeat response
+
+Requires `setup-permissions` if the agent doesn't run as root.
+
 ## Architecture
 
 ```
