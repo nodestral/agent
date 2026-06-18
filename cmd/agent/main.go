@@ -20,6 +20,12 @@ import (
 const version = "0.2.4"
 
 func main() {
+  // Handle subcommands before flag parsing
+  if len(os.Args) > 1 && os.Args[1] == "setup-permissions" {
+    setupPermissions()
+    return
+  }
+
   configPath := flag.String("config", "", "path to agent config file")
   flag.Parse()
 
