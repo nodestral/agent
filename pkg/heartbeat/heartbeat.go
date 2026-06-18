@@ -7,6 +7,7 @@ import (
   "io"
   "log"
   "net/http"
+  "os/exec"
   "time"
 
   "github.com/nodestral/agent/pkg/config"
@@ -142,12 +143,16 @@ func (s *Sender) send(ctx context.Context) {
   // Parse full response for self-update check
   bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
   var hbResp struct {
-    NodeExporterAction string `json:"node_exporter_action"`
-    LatestAgentVersion string `json:"latest_agent_version"`
+    NodeExporterAction    string `json:"node_exporter_action"`
+    LatestAgentVersion    string `json:"latest_agent_version"`
+    RestartServiceAction  string `json:"restart_service_action"`
   }
   if json.Unmarshal(bodyBytes, &hbResp) == nil {
     if hbResp.NodeExporterAction != "" {
       s.handleNodeExporterAction(hbResp.NodeExporterAction)
+    }
+    if hbResp.RestartServiceAction != "" {
+      s.handleServiceRestart(hbResp.RestartServiceAction)
     }
     if hbResp.LatestAgentVersion != "" {
       // Run self-update in background (will restart if successful)
@@ -179,4 +184,35 @@ func (s *Sender) handleNodeExporterAction(action string) {
       }
     }()
   }
+}
+
+func (s *Sender) handleServiceRestart(service string) {
+	log.Printf("service-restart: restart requested for %s", service)
+	go func() {
+		// Validate service name (prevent injection)
+		if len(service) == 0 || len(service) > 255 {
+			log.Printf("service-restart: invalid service name %q", service)
+			return
+		}
+
+		// Try without sudo first
+		if err := execCommand("systemctl", "restart", service); err != nil {
+			log.Printf("service-restart: restart without sudo failed: %v, trying with sudo", err)
+			// Try with sudo
+			if err := execCommand("sudo", "systemctl", "restart", service); err != nil {
+				log.Printf("service-restart: restart with sudo also failed: %v", err)
+				return
+			}
+		}
+		log.Printf("service-restart: %s restarted successfully", service)
+	}()
+}
+
+func execCommand(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	output, err := cmd.CombinedOutput()
+	if len(output) > 0 {
+		log.Printf("exec: %s output: %s", name, string(output))
+	}
+	return err
 }
